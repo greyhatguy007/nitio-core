@@ -9,8 +9,8 @@
  */
 package org.simpmusic.listentogether
 
-import com.maxrave.ktorext.getEngine
-import com.maxrave.logger.Logger
+import com.greyhatguy007.ktorext.getEngine
+import com.greyhatguy007.logger.Logger
 import io.ktor.client.HttpClient
 import io.ktor.client.plugins.UserAgent
 import io.ktor.client.plugins.websocket.DefaultClientWebSocketSession

@@ -1,10 +1,10 @@
 package com.simpmusic.media_jvm.di
 
-import com.maxrave.common.Config.SERVICE_SCOPE
-import com.maxrave.domain.mediaservice.handler.DownloadHandler
-import com.maxrave.domain.mediaservice.player.MediaPlayerInterface
-import com.maxrave.domain.notification.DesktopNotificationManager
-import com.maxrave.domain.repository.CacheRepository
+import com.greyhatguy007.common.Config.SERVICE_SCOPE
+import com.greyhatguy007.domain.mediaservice.handler.DownloadHandler
+import com.greyhatguy007.domain.mediaservice.player.MediaPlayerInterface
+import com.greyhatguy007.domain.notification.DesktopNotificationManager
+import com.greyhatguy007.domain.repository.CacheRepository
 import com.simpmusic.media_jvm.download.DownloadUtils
 import com.simpmusic.media_jvm.mpv.MpvPlayerAdapter
 import com.simpmusic.media_jvm.notification.NucleusDesktopNotificationManager

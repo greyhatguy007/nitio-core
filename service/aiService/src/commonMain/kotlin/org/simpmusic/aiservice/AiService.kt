@@ -9,8 +9,8 @@ import com.aallam.openai.client.OpenAI
 import com.aallam.openai.client.OpenAIConfig
 import com.aallam.openai.client.OpenAIHost
 import com.aallam.openai.client.OpenAIHost.Companion.Gemini
-import com.maxrave.domain.data.model.metadata.Line
-import com.maxrave.domain.data.model.metadata.Lyrics
+import com.greyhatguy007.domain.data.model.metadata.Line
+import com.greyhatguy007.domain.data.model.metadata.Lyrics
 import kotlinx.serialization.builtins.MapSerializer
 import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.json.Json

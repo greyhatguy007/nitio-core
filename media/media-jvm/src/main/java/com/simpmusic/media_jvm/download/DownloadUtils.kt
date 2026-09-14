@@ -1,14 +1,14 @@
 package com.simpmusic.media_jvm.download
 
-import com.maxrave.common.MERGING_DATA_TYPE
-import com.maxrave.domain.data.entities.DownloadState
-import com.maxrave.domain.manager.DataStoreManager
-import com.maxrave.domain.mediaservice.handler.DownloadHandler
-import com.maxrave.domain.notification.DesktopNotificationManager
-import com.maxrave.domain.repository.SongRepository
-import com.maxrave.domain.repository.StreamRepository
-import com.maxrave.domain.utils.toTrack
-import com.maxrave.logger.Logger
+import com.greyhatguy007.common.MERGING_DATA_TYPE
+import com.greyhatguy007.domain.data.entities.DownloadState
+import com.greyhatguy007.domain.manager.DataStoreManager
+import com.greyhatguy007.domain.mediaservice.handler.DownloadHandler
+import com.greyhatguy007.domain.notification.DesktopNotificationManager
+import com.greyhatguy007.domain.repository.SongRepository
+import com.greyhatguy007.domain.repository.StreamRepository
+import com.greyhatguy007.domain.utils.toTrack
+import com.greyhatguy007.logger.Logger
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -211,4 +211,4 @@ internal class DownloadUtils(
     }
 }
 
-fun getDownloadPath(): String = System.getProperty("user.home") + File.separator + ".simpmusic" + File.separator + "downloads"
+fun getDownloadPath(): String = System.getProperty("user.home") + File.separator + ".com.greyhatguy007.nitio" + File.separator + "downloads"

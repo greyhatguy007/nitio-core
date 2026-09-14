@@ -1,6 +1,6 @@
 package com.my.kizzy.gateway
 
-import com.maxrave.logger.Logger
+import com.greyhatguy007.logger.Logger
 import com.my.kizzy.gateway.entities.Heartbeat
 import com.my.kizzy.gateway.entities.Identify.Companion.toIdentifyPayload
 import com.my.kizzy.gateway.entities.Payload

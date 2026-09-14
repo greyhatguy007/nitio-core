@@ -28,7 +28,7 @@ class LiveRoomSyncTest {
         ListenTogetherSession(
             ListenTogetherClient(
                 clientVersion = version,
-                userAgent = "SimpMusic/test (org.simpmusic.test; JVM)",
+                userAgent = "SimpMusic/test (org.com.greyhatguy007.nitio.test; JVM)",
             ),
         )
 
@@ -52,8 +52,8 @@ class LiveRoomSyncTest {
     @Test
     fun aGuestFollowsTheHostThroughARealRoom() =
         runBlocking {
-            val host = session("simpmusic-host-test")
-            val guest = session("simpmusic-guest-test")
+            val host = session("com.greyhatguy007.nitio-host-test")
+            val guest = session("com.greyhatguy007.nitio-guest-test")
 
             try {
                 host.connect()

@@ -8,8 +8,8 @@ import com.atilika.kuromoji.dict.UnknownDictionary
 import com.atilika.kuromoji.ipadic.Tokenizer
 import com.atilika.kuromoji.trie.DoubleArrayTrie
 import com.atilika.kuromoji.util.ResourceResolver
-import com.maxrave.ktorext.getEngine
-import com.maxrave.logger.Logger
+import com.greyhatguy007.ktorext.getEngine
+import com.greyhatguy007.logger.Logger
 import io.ktor.client.HttpClient
 import io.ktor.client.request.prepareGet
 import io.ktor.client.statement.bodyAsChannel
@@ -17,7 +17,6 @@ import io.ktor.http.contentLength
 import io.ktor.http.isSuccess
 import io.ktor.utils.io.readAvailable
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.IO
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.IOException

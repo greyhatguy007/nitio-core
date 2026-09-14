@@ -1,9 +1,9 @@
 package com.simpmusic.media_jvm.notification
 
-import com.maxrave.domain.manager.DataStoreManager
-import com.maxrave.domain.notification.DesktopNotificationManager
-import com.maxrave.domain.notification.DesktopNotificationPermissionState
-import com.maxrave.logger.Logger
+import com.greyhatguy007.domain.manager.DataStoreManager
+import com.greyhatguy007.domain.notification.DesktopNotificationManager
+import com.greyhatguy007.domain.notification.DesktopNotificationPermissionState
+import com.greyhatguy007.logger.Logger
 import dev.nucleusframework.notification.AuthorizationOption
 import dev.nucleusframework.notification.AuthorizationStatus
 import dev.nucleusframework.notification.NotificationCenter

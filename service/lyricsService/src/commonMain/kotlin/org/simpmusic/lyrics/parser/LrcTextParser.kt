@@ -1,6 +1,6 @@
 package org.simpmusic.lyrics.parser
 
-import com.maxrave.domain.extension.decodeHtmlEntities
+import com.greyhatguy007.domain.extension.decodeHtmlEntities
 import org.simpmusic.lyrics.domain.Lyrics
 
 fun parseSyncedLyrics(data: String): Lyrics {

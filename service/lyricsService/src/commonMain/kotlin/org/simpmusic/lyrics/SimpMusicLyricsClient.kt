@@ -1,8 +1,8 @@
 package org.simpmusic.lyrics
 
-import com.maxrave.ktorext.crypto.Hmac
-import com.maxrave.ktorext.crypto.HmacUri
-import com.maxrave.logger.Logger
+import com.greyhatguy007.ktorext.crypto.Hmac
+import com.greyhatguy007.ktorext.crypto.HmacUri
+import com.greyhatguy007.logger.Logger
 import io.ktor.client.call.body
 import io.ktor.client.statement.HttpResponse
 import io.ktor.client.statement.bodyAsText
@@ -28,7 +28,7 @@ private const val TAG = "SimpMusicLyricsClient"
 class SimpMusicLyricsClient {
     private val algorithm = ""
 
-    private val hmacService = Hmac("HmacSHA256", "simpmusic-lyrics")
+    private val hmacService = Hmac("HmacSHA256", "com.greyhatguy007.nitio-lyrics")
     private val lyricsService = SimpMusicLyrics()
     private var insertingLyrics: Pair<String?, Boolean> = (null to false)
     private val isInsertingLyrics: Boolean

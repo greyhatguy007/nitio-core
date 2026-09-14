@@ -1,6 +1,6 @@
 package org.simpmusic.aiservice
 
-import com.maxrave.domain.data.model.metadata.Lyrics
+import com.greyhatguy007.domain.data.model.metadata.Lyrics
 
 class AiClient {
     private var aiService: AiService? = null

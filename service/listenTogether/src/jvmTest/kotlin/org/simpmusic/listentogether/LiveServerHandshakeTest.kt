@@ -33,8 +33,8 @@ class LiveServerHandshakeTest {
         runBlocking {
             val client =
                 ListenTogetherClient(
-                    clientVersion = "simpmusic-live-test",
-                    userAgent = "SimpMusic/test (org.simpmusic.test; JVM)",
+                    clientVersion = "com.greyhatguy007.nitio-live-test",
+                    userAgent = "SimpMusic/test (org.com.greyhatguy007.nitio.test; JVM)",
                 )
             val received = Channel<ListenTogetherEvent>(Channel.UNLIMITED)
             val collector = launch { client.events.collect { received.send(it) } }
