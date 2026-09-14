@@ -41,7 +41,7 @@ class LiveDuoRelayTest {
         ListenTogetherSession(
             ListenTogetherClient(
                 clientVersion = version,
-                serverUrl = { "wss://listen.greyhatguy007.win/ws" },
+                serverUrl = { "wss://example.com/ws" },
                 userAgent = "SimpMusic/test (org.com.greyhatguy007.nitio.test; JVM)",
             ),
         )
