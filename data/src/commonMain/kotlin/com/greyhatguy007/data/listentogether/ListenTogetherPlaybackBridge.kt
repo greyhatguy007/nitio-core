@@ -50,11 +50,30 @@ private data class RoomSnapshot(
  *
  * Direction of travel is decided entirely by who hosts:
  * - **Host** watches the local player and publishes what it does.
- * - **Guest** watches the room and applies what the host did, and publishes nothing.
+ * - **Guest** watches the room and applies what the host did. It publishes nothing itself, because
+ *   the server refuses `playback_action` from anyone but the host.
  *
- * The [applyingRemote] guard is what stops those two from feeding each other: applying a remote
- * pause makes the local player report "paused", which would otherwise be published straight back
- * to the server as a fresh command.
+ * Duo mode (`repository.pairListeningMode`) makes the guest a driver rather than a listener, but not
+ * by giving it a second way to publish: the server refuses `playback_action` from anyone but the
+ * host, and it refuses `transfer_host` from anyone but the host too. So the guest asks for the ROLE
+ * (see [ControlRelay]), the host hands it over, and whoever holds it drives natively — real payloads,
+ * queue included. That is the whole of the baton, and its value is that **exactly one side of the
+ * room is ever publishing**, decided by the server rather than by us. The setting has to be on at
+ * BOTH ends: one side has to know to ask, the other has to agree to let go.
+ *
+ * The [applyingRemote] guard is what stops the two roles from feeding each other: applying a remote
+ * pause makes the local player report "paused", which would otherwise be published straight back to
+ * the server as a fresh command. It is not enough on its own — the player's flows routinely deliver
+ * that observation after the guard has been cleared — so the track and seek paths also compare what
+ * they are about to say against the ROOM's own view and stay silent when it agrees: an echoed
+ * `change_track` would restart the song from the top for everyone, and an echoed seek would travel
+ * back at the host. Those two compare values the SERVER owns (the current track id, the room's
+ * position), which is what makes the comparison trustworthy.
+ *
+ * Play/pause has no such value to compare against — see [publishOrRelayPlayPause] — so it suppresses
+ * an echo by remembering the intent it last applied. That matters most right after a handover: the
+ * device that just gave the role away applies the new host's first command, and an unguarded echo
+ * there would ask for the role straight back and silently undo the handover it just agreed to.
  */
 class ListenTogetherPlaybackBridge(
     /**
@@ -82,6 +101,30 @@ class ListenTogetherPlaybackBridge(
      */
     private var lastRoomPlaying = false
 
+    /**
+     * The play/pause intent this device last took FROM the room, and when.
+     *
+     * A boolean cannot do this job, which is why [applyingRemote] is not enough on its own: it is
+     * cleared the moment a remote command finishes being applied, while the player's flows report the
+     * resulting change a moment later. Remembering WHICH intent was applied, and for how long it
+     * stays attributable, is what lets an echo be told apart from the user pressing the same button —
+     * see [publishOrRelayPlayPause].
+     */
+    private var lastRemotePlayingIntent: Boolean? = null
+    private var lastRemoteApplyAtMs = 0L
+
+    /** When this device last asked to hold the room's controls. See [requestBaton]. */
+    private var batonRequestedAtMs = 0L
+
+    /**
+     * Where the command this device is currently applying asked it to be.
+     *
+     * Cleared as soon as the player arrives, which is the point: it makes the "this report is our
+     * own settling, not the user" suppression last exactly as long as there is settling to suppress,
+     * rather than for a fixed period after every remote command. See [publishOrRelaySeeks].
+     */
+    private var pendingRemotePosition: Long? = null
+
     /** Idempotent: callers cannot know whether something else already started it. */
     fun start() {
         if (started) return
@@ -90,12 +133,13 @@ class ListenTogetherPlaybackBridge(
         scope.launch { suppressCrossfadeWhileInRoom() }
         scope.launch { watchRoomForGuests() }
         scope.launch { resyncGuestOnResume() }
+        scope.launch { applyRelayedControlsAsHost() }
         scope.launch { publishCurrentStateOnJoin() }
         scope.launch { publishStateWhenSomeoneArrives() }
-        scope.launch { publishQueueAsHostOrPairGuest() }
-        scope.launch { publishTrackChangesAsHostOrPairGuest() }
-        scope.launch { publishPlayPauseAsHostOrPairGuest() }
-        scope.launch { publishSeeksAsHostOrPairGuest() }
+        scope.launch { publishQueueAsHost() }
+        scope.launch { publishOrRelayTrackChanges() }
+        scope.launch { publishOrRelayPlayPause() }
+        scope.launch { publishOrRelaySeeks() }
         scope.launch { answerBufferBarrier() }
     }
 
@@ -133,6 +177,10 @@ class ListenTogetherPlaybackBridge(
      * pressing play again asks the server where the room actually is now, so resuming lands in the
      * right place instead of wherever this device stopped. This is what Metrolist's manager does
      * (`requestSync` — "call this when a guest presses play/pause").
+     *
+     * In duo mode this does not apply: the guest's transport takes the room over instead, so its
+     * pause becomes the room's pause. Hence the early return below, which is the only thing that
+     * keeps the two behaviours from fighting.
      */
     private suspend fun resyncGuestOnResume() {
         handler.controlState
@@ -162,7 +210,13 @@ class ListenTogetherPlaybackBridge(
                     isPlaying = it.isPlaying,
                     position = it.position,
                     queueIds = it.queue.map { t -> t.id },
-                ) to (it.inRoom && (!it.isHost || repository.pairListeningMode))
+                    // Follow the room we are a GUEST in, and only that one. The old shape
+                    // (`|| pairListeningMode`) also had the HOST apply the room it owns, which was
+                    // right while commands were relayed one at a time — the host had to obey the
+                    // broadcast it had just published on a guest's behalf. The baton leaves nothing
+                    // to obey: whoever holds the role IS the authority, and applying our own
+                    // broadcast back to ourselves is a second opinion nobody asked for.
+                ) to (it.inRoom && !it.isHost)
             }
             .distinctUntilChanged()
             .collect { (snapshot, shouldFollow) ->
@@ -183,6 +237,13 @@ class ListenTogetherPlaybackBridge(
                     // with the track unchanged, and is applied normally.
                     val playing = if (trackChanged && !isPlaying) lastRoomPlaying else isPlaying
                     lastRoomPlaying = playing
+                    // Remember the intent we are about to impose, so its echo — which the player
+                    // reports a moment later, long after [applyingRemote] has been cleared — can be
+                    // told apart from the user pressing the same button. See
+                    // [publishOrRelayPlayPause].
+                    lastRemotePlayingIntent = playing
+                    lastRemoteApplyAtMs = elapsedMs()
+                    pendingRemotePosition = null
                     if (trackChanged && track != null) {
                         val sameTrack = track.id == lastAppliedTrackId
                         lastAppliedTrackId = track.id
@@ -223,6 +284,9 @@ class ListenTogetherPlaybackBridge(
         // A small drift is normal and seeking on every tick would stutter; only a real gap is worth
         // a seek, which is also why the host publishes position with each command.
         if (abs(handler.player.currentPosition - corrected) > SEEK_TOLERANCE_MS) {
+            // Where we are being sent, so the reports that still say where we WERE can be told apart
+            // from the user dragging the scrubber. See [publishOrRelaySeeks].
+            pendingRemotePosition = corrected
             handler.player.seekTo(corrected)
         }
         if (isPlaying && !handler.player.playWhenReady) {
@@ -307,10 +371,15 @@ class ListenTogetherPlaybackBridge(
     /**
      * Publishes what is ALREADY playing the moment we become host.
      *
-     * Everything else here reacts to a *change* — a track transition, a play/pause. Someone who
-     * was already listening and then opens a room produces neither, so without this the room has
-     * no state at all and every guest sits in silence waiting for a command that only arrives if
-     * the host happens to touch the transport.
+     * Everything else here reacts to a *change* — a track transition, a play/pause. Someone who was
+     * already listening and then opens a room produces neither, so without this the room has no state
+     * at all and every guest sits in silence waiting for a command that only arrives if the host
+     * happens to touch the transport.
+     *
+     * It is also how a HANDOVER lands, which is why it is keyed on becoming host rather than on
+     * joining one. A duo-mode guest does not send the command that took the room over — it asks for
+     * the role, and this publish is what tells everyone what it did with it: its own real track,
+     * position and queue, rather than a command reconstructed from a truncated carrier.
      */
     private suspend fun publishCurrentStateOnJoin() {
         repository.room
@@ -335,22 +404,29 @@ class ListenTogetherPlaybackBridge(
             }
     }
 
-    /** Republishes the queue whenever the host's (or pair-mode guest's) own queue changes. */
-    private suspend fun publishQueueAsHostOrPairGuest() {
+    /**
+     * Republishes the queue whenever the HOST's own queue changes.
+     *
+     * Deliberately host-only, even in duo mode where a guest mirrors everything else it does. A
+     * whole queue cannot ride a relay — the carrier is a 50-character `suggestedBy`, see
+     * [ControlRelay] — and a guest syncing its own order would overwrite the host's on every track,
+     * because both ends rebuild the room's queue from what the server holds. A duo-mode guest still
+     * chooses WHAT plays: that is a track change, and it is relayed. The order stays the host's.
+     */
+    private suspend fun publishQueueAsHost() {
         handler.queueData
-            .map { (it as? QueueData.Data)?.listTracks?.map { t -> t.videoId }.orEmpty() }
+            .map { it?.data?.listTracks?.map { t -> t.videoId }.orEmpty() }
             .distinctUntilChanged()
             .collect { ids ->
                 val state = repository.room.value
-                val canPublish = state.inRoom && (state.isHost || repository.pairListeningMode)
-                if (!canPublish || applyingRemote || ids.isEmpty()) return@collect
+                if (!state.inRoom || !state.isHost || applyingRemote || ids.isEmpty()) return@collect
                 lastAppliedQueueIds = ids
                 publishQueue()
             }
     }
 
     private fun publishQueue() {
-        val data = handler.queueData.value as? QueueData.Data ?: return
+        val data = handler.queueData.value?.data ?: return
         val tracks = data.listTracks.map { it.toTrackInfo() }
         if (tracks.isEmpty()) return
         session.sendQueue(tracks, data.playlistName.orEmpty())
@@ -362,52 +438,89 @@ class ListenTogetherPlaybackBridge(
         if (item.mediaId.isBlank()) return
         lastPublishedTrackId = item.mediaId
         lastAppliedTrackId = item.mediaId
-        val data = handler.queueData.value as? QueueData.Data
+        val data = handler.queueData.value?.data
         val queueIds = data?.listTracks.orEmpty().map { it.videoId }
         if (queueIds.isNotEmpty()) {
             lastAppliedQueueIds = queueIds
         }
-        session.sendPlaybackAction(
-            action = PlaybackActions.CHANGE_TRACK,
-            trackId = item.mediaId,
-            position = handler.player.currentPosition,
-            trackInfo = item.toTrackInfo(),
-            queue = data?.listTracks.orEmpty().map { it.toTrackInfo() },
-            queueTitle = data?.playlistName.orEmpty(),
-        )
-        // A second command, because change_track alone does not say whether it is running —
-        // the server explicitly sets IsPlaying=false on a track change.
+        val position = handler.player.currentPosition
+        // A change_track goes out ONLY when the room is on a different song.
+        //
+        // For one it already has, the command is not a harmless no-op — it is destructive. The
+        // server forces `Position = 0` and `IsPlaying = false` on every change_track and
+        // rebroadcasts exactly that, discarding the position the sender put in the payload (see
+        // `ActionChangeTrack`, which ends `p.Position = 0`). So a redundant one rewinds every
+        // listener to the top of the song and makes them rebuild the media item. This is the whole
+        // of the "seeking restarts the music for both" bug: a handover's snapshot sent a
+        // change_track, the other device obeyed the zero, and its own report of that rewind then
+        // travelled back as a fresh seek.
+        //
+        // The position does not need it either. PLAY and PAUSE both carry one and the server
+        // applies it (`room.State.Position = p.Position`), so a single one of those says everything
+        // a same-track handover has to say — and unlike a change_track, it moves nobody's playhead
+        // to zero on the way.
+        if (repository.room.value.currentTrack?.id != item.mediaId) {
+            session.sendPlaybackAction(
+                action = PlaybackActions.CHANGE_TRACK,
+                trackId = item.mediaId,
+                // Zero because the server discards it, not because zero is what we want.
+                position = 0L,
+                trackInfo = item.toTrackInfo(),
+                queue = data?.listTracks.orEmpty().map { it.toTrackInfo() },
+                queueTitle = data?.playlistName.orEmpty(),
+            )
+            // Because that position IS discarded, a room that should pick up part-way through has
+            // to say so separately. Only when there is a position worth carrying.
+            if (position > SEEK_TOLERANCE_MS) {
+                session.sendPlaybackAction(
+                    action = PlaybackActions.SEEK,
+                    trackId = "",
+                    position = position,
+                    trackInfo = null,
+                )
+            }
+        }
+        // Never optional: a change_track does not say whether the room is running — the server
+        // explicitly sets IsPlaying=false on one — and on a same-track handover this is the command
+        // that carries the real position.
         session.sendPlaybackAction(
             action = if (handler.player.playWhenReady) PlaybackActions.PLAY else PlaybackActions.PAUSE,
             trackId = "",
-            position = handler.player.currentPosition,
+            position = position,
             trackInfo = null,
         )
-        Logger.i(TAG, "Published current state to the room: ${item.mediaId}")
+        Logger.i(TAG, "Published current state to the room: ${item.mediaId} @ ${position}ms")
     }
 
-    private suspend fun publishTrackChangesAsHostOrPairGuest() {
+    /** Announces whatever the local player moves on to, as a host or as a duo-mode guest. */
+    private suspend fun publishOrRelayTrackChanges() {
         handler.nowPlaying
             .filterNotNull()
             .distinctUntilChanged { old, new -> old.mediaId == new.mediaId }
             .collect { item ->
                 val state = repository.room.value
-                val canPublish = state.inRoom && (state.isHost || repository.pairListeningMode)
-                if (!canPublish || applyingRemote) return@collect
+                val canAct = state.inRoom && (state.isHost || repository.pairListeningMode)
+                if (!canAct || applyingRemote) return@collect
                 if (item.mediaId == lastPublishedTrackId) return@collect
+                // A track the ROOM is already on needs no announcement, and in duo mode that is the
+                // common case rather than an edge one: the guest applies the host's command and its
+                // own player reports the change a moment later. Relaying it back would tell the host
+                // to change to the song it is already playing — and `change_track` carries position
+                // 0, so the echo restarts it from the top for everyone.
+                if (item.mediaId == state.currentTrack?.id) return@collect
                 lastPublishedTrackId = item.mediaId
                 lastAppliedTrackId = item.mediaId
-                val data = handler.queueData.value as? QueueData.Data
+                val data = handler.queueData.value?.data
                 val ids = data?.listTracks.orEmpty().map { it.videoId }
                 if (ids.isNotEmpty()) {
                     lastAppliedQueueIds = ids
                 }
-                Logger.i(TAG, "${if (state.isHost) "Host" else "Pair Mode Guest"} publishing track change: ${item.mediaId}")
-                session.sendPlaybackAction(
+                Logger.i(TAG, "${if (state.isHost) "Host" else "Duo guest"} intends a track change: ${item.mediaId}")
+                publishOrRelay(
                     action = PlaybackActions.CHANGE_TRACK,
                     trackId = item.mediaId,
                     position = 0L,
-                    trackInfo = item.toTrackInfo(),
+                    track = item.toTrackInfo(),
                     queue = data?.listTracks.orEmpty().map { it.toTrackInfo() },
                     queueTitle = data?.playlistName.orEmpty(),
                 )
@@ -434,38 +547,68 @@ class ListenTogetherPlaybackBridge(
                         }
                     } != null
                 if (started) {
-                    session.sendPlaybackAction(
+                    // Naming the track we just moved to matters only to a relay: the carrier has to
+                    // be a well-formed suggestion, and the song being played is the honest way to
+                    // make it one. A host publishes no metadata on a PLAY.
+                    publishOrRelay(
                         action = PlaybackActions.PLAY,
-                        trackId = "",
                         position = handler.player.currentPosition,
-                        trackInfo = null,
+                        track = item.toTrackInfo(),
                     )
                 }
             }
     }
 
-    private suspend fun publishPlayPauseAsHostOrPairGuest() {
+    /** Announces play/pause, as a host or as a duo-mode guest. */
+    private suspend fun publishOrRelayPlayPause() {
         handler.controlState
             .map { it.isPlaying }
             .distinctUntilChanged()
             .collect { isPlaying ->
                 val state = repository.room.value
-                val canPublish = state.inRoom && (state.isHost || repository.pairListeningMode)
-                if (!canPublish || applyingRemote) return@collect
+                val canAct = state.inRoom && (state.isHost || repository.pairListeningMode)
+                if (!canAct || applyingRemote) return@collect
                 // A host that merely buffers reports isPlaying=false, indistinguishable from a
                 // user pause — and publishing it stops the WHOLE room on one device's hiccup.
                 // playWhenReady carries the intent, so a dip where the two disagree is not news.
                 val intent = handler.player.playWhenReady
                 if (isPlaying != intent) return@collect
-                Logger.i(TAG, "${if (state.isHost) "Host" else "Pair Mode Guest"} publishing ${if (intent) "PLAY" else "PAUSE"}")
-                session.sendPlaybackAction(
+                // A PLAY for a room with no track is refused outright — the server answers
+                // `no_track` ("Cannot play without a track") and the app has no way to act on it.
+                // It is also never the useful command: the song that is starting reaches the room as
+                // a change_track a moment later, and that is what carries the track with it. This is
+                // reachable because controlState turns true as soon as a load begins, while
+                // nowPlaying is still the old (or no) track.
+                if (intent && state.currentTrack == null) {
+                    Logger.i(TAG, "Not playing the room — it has no track yet; the track change will say so")
+                    return@collect
+                }
+                // Deliberately NO "the room already agrees" test here, unlike the track and seek
+                // paths. `isPlaying` is not a value the room owns: the server forces it FALSE on
+                // every `change_track`, and each client carries the real intent privately (see
+                // [watchRoomForGuests]). In the window after a track change it therefore reads
+                // false while everyone is genuinely playing, and testing against it would silently
+                // swallow a real pause — the exact class of bug this whole feature exists to fix.
+                //
+                // What IS compared is what this device last applied from the room. An echo of a remote
+                // command must not be read as a fresh user intent, and that is not academic: the device
+                // that has just handed the baton away applies the new host's first command, and
+                // without this it would send that observation straight back and ask for the role
+                // again — undoing the handover it had just agreed to, with nothing on screen to
+                // explain it. Only the intent we applied is suppressed, and only briefly, so a user
+                // pressing the opposite button inside the window is still heard.
+                if (lastRemotePlayingIntent == intent && elapsedMs() - lastRemoteApplyAtMs < REMOTE_ECHO_WINDOW_MS) {
+                    Logger.i(TAG, "Echo of the ${if (intent) "PLAY" else "PAUSE"} just applied — not acting on it")
+                    return@collect
+                }
+                Logger.i(TAG, "${if (state.isHost) "Host" else "Duo guest"} intends ${if (intent) "PLAY" else "PAUSE"}")
+                publishOrRelay(
                     action = if (intent) PlaybackActions.PLAY else PlaybackActions.PAUSE,
                     // Deliberately EMPTY. The server rejects a play/pause whose trackId does not
                     // match the track it is holding ("stale_track") and drops it silently; sending
                     // nothing makes it fill in its own current track, which is always right.
                     trackId = "",
                     position = handler.player.currentPosition,
-                    trackInfo = null,
                 )
             }
     }
@@ -480,8 +623,11 @@ class ListenTogetherPlaybackBridge(
      * Media3's `onPositionDiscontinuity(DISCONTINUITY_REASON_SEEK)`, but that is an Android-only
      * API and Desktop runs mpv. A seek is a position that moved further than wall-clock time could
      * account for; ordinary playback advances roughly in step with it.
+     *
+     * Sent by a host, or relayed by a duo-mode guest — the decision is [publishOrRelay]'s, and the
+     * echo guard below is what keeps the two way traffic from circling.
      */
-    private suspend fun publishSeeksAsHostOrPairGuest() {
+    private suspend fun publishOrRelaySeeks() {
         var lastProgress = 0L
         var lastAt = 0L
         handler.simpleMediaState.collect { mediaState ->
@@ -493,23 +639,186 @@ class ListenTogetherPlaybackBridge(
             lastAt = now
 
             val state = repository.room.value
-            val canPublish = state.inRoom && (state.isHost || repository.pairListeningMode)
-            if (!canPublish || applyingRemote) return@collect
+            val canAct = state.inRoom && (state.isHost || repository.pairListeningMode)
+            if (!canAct || applyingRemote) return@collect
+            // The player's own report of a command we just applied is not ours to announce. A seek
+            // does not take effect instantly, so for a moment afterwards the player still reports
+            // where it WAS, and a media rebuild reports zero outright — either of which looks
+            // exactly like somebody dragging the scrubber. Announcing that is how a room gets
+            // dragged BACKWARDS: the follower's stale position goes out as a fresh seek, and the
+            // device that actually seeked is pulled to where this one used to be.
+            //
+            // The suppression ends the moment the player has actually arrived, so a drag that
+            // follows a remote command is only ever lost while the command is still settling.
+            if (elapsedMs() - lastRemoteApplyAtMs < REMOTE_SETTLE_WINDOW_MS) {
+                val target = pendingRemotePosition
+                if (target == null || abs(progress - target) > SEEK_DETECT_MS) return@collect
+                pendingRemotePosition = null
+            }
             if (previousAt == 0L) return@collect
 
             val elapsed = now - previousAt
             val expected = previous + if (handler.player.isPlaying) elapsed else 0L
             if (kotlin.math.abs(progress - expected) < SEEK_DETECT_MS) return@collect
+            // A seek is only ours to announce while it takes us away from where the ROOM expects us
+            // to be. Every seek we apply from the room lands exactly there, which is what stops a
+            // duo-mode guest from bouncing the host's own seek back at it.
+            if (kotlin.math.abs(progress - session.positionAt(state.position, state.isPlaying)) < SEEK_DETECT_MS) return@collect
 
-            Logger.i(TAG, "${if (state.isHost) "Host" else "Pair Mode Guest"} publishing SEEK to $progress (expected ~$expected)")
-            session.sendPlaybackAction(
+            Logger.i(TAG, "${if (state.isHost) "Host" else "Duo guest"} intends a seek to $progress (expected ~$expected)")
+            publishOrRelay(
                 action = PlaybackActions.SEEK,
                 trackId = "",
                 position = progress,
-                trackInfo = null,
             )
         }
     }
+
+    // ────────────────── duo mode: the baton, and who is holding it ──────────────────
+
+    /**
+     * Answers what duo-mode guests ask of us, with this client's own host authority.
+     *
+     * Only the host is ever sent one of these — `suggestion_received` goes nowhere else — and it is
+     * also the only side of the room the server accepts a `playback_action` or a `transfer_host`
+     * from, which is what makes the arrangement work at all.
+     *
+     * The ask is normally for the ROLE: `transfer_host` to whoever requested it, after which that
+     * device drives natively and this one becomes a follower. Nothing is performed on its behalf,
+     * because a role change can express everything a command can — and the new host's first publish
+     * is its own real state, position and queue included, rather than a command rebuilt here from a
+     * carrier that had room for one track and nothing else.
+     *
+     * A transport command is still honoured, because a guest on a build that predates the handover
+     * sends one; it is performed and this client keeps the role, which is the behaviour that build
+     * was written against.
+     *
+     * Duo mode has to be on HERE as well as on the guest. Neither shape means anything between two
+     * clients that do not both understand it, and a host that has not opted in should leave the ask
+     * alone rather than act on one it never agreed to take. The suggestion is still cleared either
+     * way, by the session, so nothing accumulates on the server.
+     */
+    private suspend fun applyRelayedControlsAsHost() {
+        session.relayedControls.collect { control ->
+            val state = repository.room.value
+            if (!state.inRoom || !state.isHost) return@collect
+            if (!repository.pairListeningMode) {
+                Logger.w(TAG, "${control.action} dropped — duo mode is off on this host")
+                return@collect
+            }
+            if (control.isTakeOver) {
+                // The server refuses `transfer_host` from anyone but the host and refuses to
+                // transfer to the host itself, so both of these mean a malformed or stale ask
+                // rather than anything worth acting on.
+                if (control.fromUserId.isBlank() || control.fromUserId == state.selfUserId) {
+                    Logger.w(TAG, "Take-over request with nobody to hand the room to — ignored")
+                    return@collect
+                }
+                Logger.i(TAG, "Handing the room to ${control.fromUserId} — they asked to control it")
+                repository.transferHost(control.fromUserId)
+                return@collect
+            }
+            Logger.i(TAG, "Guest relayed ${control.action} @ ${control.positionMs}ms on ${control.trackId} (peer older than the handover)")
+            if (control.action == PlaybackActions.CHANGE_TRACK) {
+                // The queue the guest sent is not part of the relay — it cannot be, see
+                // [ControlRelay] — so the room keeps OURS. That is also what makes the guest's pick
+                // land inside the running order instead of replacing it.
+                val data = handler.queueData.value?.data
+                publishOrRelay(
+                    action = PlaybackActions.CHANGE_TRACK,
+                    trackId = control.track.id,
+                    position = 0L,
+                    track = control.track,
+                    queue = data?.listTracks.orEmpty().map { it.toTrackInfo() },
+                    queueTitle = data?.playlistName.orEmpty(),
+                )
+                return@collect
+            }
+            // Loads the track locally as well, by the same route as any other room command: the
+            // server broadcasts this publish straight back and the follower applies it.
+            publishOrRelay(action = control.action, position = control.positionMs)
+        }
+    }
+
+    /**
+     * Acts on a transport command, from whichever side of the room we are on.
+     *
+     * A host publishes it. A duo-mode guest cannot — the server answers every `playback_action` from
+     * a non-host with `not_host` before it even decodes the payload — so instead of sending the
+     * command it ASKS FOR THE ROLE, and publishes everything from then on as the host it has just
+     * become. [ControlRelay] sets that arrangement out; the short of it is that the server owns the
+     * single-publisher rule, so the only way for a guest to break it is to hold the role itself.
+     *
+     * Asking rather than relaying the command is what keeps this simple. A relayed command would
+     * arrive one round trip behind the guest's own player, would reach the room as a `change_track`
+     * at position 0 instead of where the song actually is, and would be re-published by the new host
+     * a moment later regardless. None of that happens with the handover, because the new host's first
+     * act is to publish its own real state — see [publishCurrentStateOnJoin].
+     *
+     * [track] is metadata for a CHANGE_TRACK alone: play, pause and seek carry none, and the server
+     * fills in its own current track. It is still needed when asking for the role, because the ask
+     * travels as a suggestion and the server drops one without an id and a title — so the carrier is
+     * whatever the room is on, falling back to whatever this device has loaded. `queue` and
+     * `queueTitle` ride only on a host's publish; they do not fit in a carrier.
+     */
+    private suspend fun publishOrRelay(
+        action: String,
+        trackId: String = "",
+        position: Long = 0L,
+        track: TrackInfo? = null,
+        queue: List<TrackInfo> = emptyList(),
+        queueTitle: String = "",
+    ) {
+        val state = repository.room.value
+        if (!state.inRoom) return
+        if (state.isHost) {
+            session.sendPlaybackAction(
+                action = action,
+                trackId = trackId,
+                position = position,
+                trackInfo = if (action == PlaybackActions.CHANGE_TRACK) track else null,
+                queue = queue,
+                queueTitle = queueTitle,
+            )
+            Logger.i(TAG, "Published $action to the room")
+            return
+        }
+        // Only duo mode reaches here — every caller gates on `pairListeningMode`, which is what a
+        // guest that has NOT opted in stays silent on. So this is an ask for the role, not a command.
+        // The local player is preferred last rather than least: a room with nothing playing yet still
+        // has to be takeable over, and this device is holding the song it wants to hear.
+        val carrier = track ?: state.currentTrack?.toProtocol() ?: handler.nowPlaying.value?.toTrackInfo()
+        if (carrier == null || carrier.id.isBlank()) {
+            Logger.w(TAG, "Not asking for control — nothing on hand to carry the request")
+            return
+        }
+        requestBaton(carrier)
+    }
+
+    /**
+     * Asks the host to hand the room over. See [ControlRelay].
+     *
+     * Throttled, and not for politeness: an ask only means anything if the host is also in duo mode
+     * and actually answers, so an unanswered one leaves this device a guest — and every further
+     * transport action would send another. The server caps a room at 100 pending suggestions and a
+     * flood would also start being rate-limited, which would take real suggestions down with it.
+     *
+     * [carrier] is not what the request is about; it exists because the ask travels as a suggestion
+     * and the server drops one without a track id and a title.
+     */
+    private suspend fun requestBaton(carrier: TrackInfo) {
+        val now = elapsedMs()
+        if (now - batonRequestedAtMs < BATON_REQUEST_COOLDOWN_MS) {
+            Logger.i(TAG, "Already asked to control the room — not asking again yet")
+            return
+        }
+        batonRequestedAtMs = now
+        Logger.i(TAG, "Duo guest asking the host for control of the room")
+        session.requestHost(carrier)
+    }
+
+    /** Monotonic milliseconds since process start — wall-clock time cannot go backwards. */
+    private fun elapsedMs(): Long = PROCESS_START.elapsedNow().inWholeMilliseconds
 
     // ─────────────────────────── the buffer barrier ───────────────────────────
 
@@ -582,5 +891,26 @@ class ListenTogetherPlaybackBridge(
          */
         const val SEEK_DETECT_MS = 2_500L
         const val READY_BUFFER_PERCENT = 5
+
+        /**
+         * How long an applied play/pause stays attributable to the room rather than to the user.
+         *
+         * Long enough to cover the player's own reporting delay after a remote command, short enough
+         * that pressing the button twice is still two commands.
+         */
+        const val REMOTE_ECHO_WINDOW_MS = 1_500L
+
+        /**
+         * How long after applying a room command the local player's position reports are still its
+         * own settling rather than the user moving the playhead. See [publishOrRelaySeeks].
+         *
+         * Longer than a seek takes to land, because a track rebuild has to complete and seek
+         * afterwards; shorter than the interval between two deliberate drags, so a real seek inside
+         * it is a rare loss rather than a swallowed one.
+         */
+        const val REMOTE_SETTLE_WINDOW_MS = 1_500L
+
+        /** How often a guest may ask for the role, so an unanswered ask cannot pile up. */
+        const val BATON_REQUEST_COOLDOWN_MS = 5_000L
     }
 }
