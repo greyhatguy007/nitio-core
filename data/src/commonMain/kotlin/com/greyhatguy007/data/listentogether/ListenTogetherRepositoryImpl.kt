@@ -46,6 +46,8 @@ class ListenTogetherRepositoryImpl(
             session.autoApproveSuggestions = value
         }
 
+    override var pairListeningMode: Boolean = false
+
     init {
         scope.launch { session.state.collect { _room.value = it.toDomain() } }
     }

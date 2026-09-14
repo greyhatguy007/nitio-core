@@ -96,6 +96,8 @@ class ListenTogetherPlaybackBridge(
         scope.launch { publishTrackChangesAsHost() }
         scope.launch { publishPlayPauseAsHost() }
         scope.launch { publishSeeksAsHost() }
+        scope.launch { publishTrackChangesAsGuestInPairMode() }
+        scope.launch { publishPlayPauseAsGuestInPairMode() }
         scope.launch { answerBufferBarrier() }
     }
 
@@ -225,9 +227,6 @@ class ListenTogetherPlaybackBridge(
         if (abs(handler.player.currentPosition - corrected) > SEEK_TOLERANCE_MS) {
             handler.player.seekTo(corrected)
         }
-        // playWhenReady, not isPlaying: a track that is still buffering reports isPlaying=false
-        // while already committed to playing, so comparing against it re-issues play() every tick
-        // and, worse, lets a stale pause land on a track that was about to start.
         if (isPlaying && !handler.player.playWhenReady) {
             handler.player.play()
         } else if (!isPlaying && handler.player.playWhenReady) {
@@ -497,6 +496,46 @@ class ListenTogetherPlaybackBridge(
                 trackInfo = null,
             )
         }
+    }
+
+    private suspend fun publishTrackChangesAsGuestInPairMode() {
+        handler.nowPlaying
+            .filterNotNull()
+            .distinctUntilChanged { old, new -> old.mediaId == new.mediaId }
+            .collect { item ->
+                val state = repository.room.value
+                if (!state.inRoom || state.isHost || !repository.pairListeningMode || applyingRemote) return@collect
+                if (item.mediaId == lastPublishedTrackId) return@collect
+                lastPublishedTrackId = item.mediaId
+                Logger.i(TAG, "Pair Mode Guest publishing track change: ${item.mediaId}")
+                val data = handler.queueData.value as? QueueData.Data
+                session.sendPlaybackAction(
+                    action = PlaybackActions.CHANGE_TRACK,
+                    trackId = item.mediaId,
+                    position = 0L,
+                    trackInfo = item.toTrackInfo(),
+                    queue = data?.listTracks.orEmpty().map { it.toTrackInfo() },
+                    queueTitle = data?.playlistName.orEmpty(),
+                )
+            }
+    }
+
+    private suspend fun publishPlayPauseAsGuestInPairMode() {
+        handler.controlState
+            .map { it.isPlaying }
+            .distinctUntilChanged()
+            .collect { playing ->
+                val state = repository.room.value
+                if (!state.inRoom || state.isHost || !repository.pairListeningMode || applyingRemote) return@collect
+                val item = handler.nowPlaying.value ?: return@collect
+                Logger.i(TAG, "Pair Mode Guest publishing play/pause: $playing")
+                session.sendPlaybackAction(
+                    action = if (playing) PlaybackActions.PLAY else PlaybackActions.PAUSE,
+                    trackId = item.mediaId,
+                    position = handler.player.currentPosition,
+                    trackInfo = null,
+                )
+            }
     }
 
     // ─────────────────────────── the buffer barrier ───────────────────────────

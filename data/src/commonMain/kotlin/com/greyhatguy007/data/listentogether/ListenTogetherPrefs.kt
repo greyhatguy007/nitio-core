@@ -10,9 +10,12 @@ package com.greyhatguy007.data.listentogether
  */
 object ListenTogetherPrefs {
     const val SERVER_URL = "lt_server_url"
+    const val SERVER_NICKNAME = "lt_server_nickname"
+    const val SAVED_SERVERS = "lt_saved_servers"
     const val AUTO_APPROVE_JOINS = "lt_auto_approve_joins"
     const val AUTO_APPROVE_SUGGESTIONS = "lt_auto_approve_suggestions"
     const val FOLLOW_HOST_VOLUME = "lt_follow_host_volume"
+    const val PAIR_LISTENING_MODE = "lt_pair_listening_mode"
     const val BLOCKLIST = "lt_blocklist"
 
     const val TRUE = "TRUE"

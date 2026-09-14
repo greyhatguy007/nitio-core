@@ -1,5 +1,23 @@
 package com.greyhatguy007.domain.data.model.listentogether
 
+import kotlinx.serialization.Serializable
+
+@Serializable
+data class ListenTogetherServer(
+    val nickname: String,
+    val url: String,
+) {
+    val displayTitle: String
+        get() = nickname.ifBlank {
+            url.substringAfter("://").substringBefore("/")
+        }
+}
+
+val DEFAULT_LISTEN_TOGETHER_SERVER = ListenTogetherServer(
+    nickname = "The Meowery · Poland",
+    url = "wss://metroserverx.meowery.eu/ws",
+)
+
 /**
  * Listen Together, as the rest of the app sees it.
  *
