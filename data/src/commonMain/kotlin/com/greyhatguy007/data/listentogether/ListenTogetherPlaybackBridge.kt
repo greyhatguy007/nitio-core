@@ -92,12 +92,10 @@ class ListenTogetherPlaybackBridge(
         scope.launch { resyncGuestOnResume() }
         scope.launch { publishCurrentStateOnJoin() }
         scope.launch { publishStateWhenSomeoneArrives() }
-        scope.launch { publishQueueAsHost() }
-        scope.launch { publishTrackChangesAsHost() }
-        scope.launch { publishPlayPauseAsHost() }
-        scope.launch { publishSeeksAsHost() }
-        scope.launch { publishTrackChangesAsGuestInPairMode() }
-        scope.launch { publishPlayPauseAsGuestInPairMode() }
+        scope.launch { publishQueueAsHostOrPairGuest() }
+        scope.launch { publishTrackChangesAsHostOrPairGuest() }
+        scope.launch { publishPlayPauseAsHostOrPairGuest() }
+        scope.launch { publishSeeksAsHostOrPairGuest() }
         scope.launch { answerBufferBarrier() }
     }
 
@@ -142,7 +140,7 @@ class ListenTogetherPlaybackBridge(
             .distinctUntilChanged()
             .collect { locallyPlaying ->
                 val room = repository.room.value
-                if (!room.inRoom || room.isHost || applyingRemote) return@collect
+                if (!room.inRoom || room.isHost || repository.pairListeningMode || applyingRemote) return@collect
                 if (!locallyPlaying) {
                     Logger.i(TAG, "Guest paused locally — leaving the room running")
                     return@collect
@@ -152,7 +150,7 @@ class ListenTogetherPlaybackBridge(
             }
     }
 
-    // ─────────────────────────── guest: follow the host ───────────────────────────
+    // ─────────────────────────── room state synchronisation ───────────────────────────
 
     private suspend fun watchRoomForGuests() {
         repository.room
@@ -164,7 +162,7 @@ class ListenTogetherPlaybackBridge(
                     isPlaying = it.isPlaying,
                     position = it.position,
                     queueIds = it.queue.map { t -> t.id },
-                ) to (it.inRoom && !it.isHost)
+                ) to (it.inRoom && (!it.isHost || repository.pairListeningMode))
             }
             .distinctUntilChanged()
             .collect { (snapshot, shouldFollow) ->
@@ -337,14 +335,16 @@ class ListenTogetherPlaybackBridge(
             }
     }
 
-    /** Republishes the queue whenever the host's own queue changes. */
-    private suspend fun publishQueueAsHost() {
+    /** Republishes the queue whenever the host's (or pair-mode guest's) own queue changes. */
+    private suspend fun publishQueueAsHostOrPairGuest() {
         handler.queueData
             .map { (it as? QueueData.Data)?.listTracks?.map { t -> t.videoId }.orEmpty() }
             .distinctUntilChanged()
             .collect { ids ->
                 val state = repository.room.value
-                if (!state.inRoom || !state.isHost || applyingRemote || ids.isEmpty()) return@collect
+                val canPublish = state.inRoom && (state.isHost || repository.pairListeningMode)
+                if (!canPublish || applyingRemote || ids.isEmpty()) return@collect
+                lastAppliedQueueIds = ids
                 publishQueue()
             }
     }
@@ -361,7 +361,12 @@ class ListenTogetherPlaybackBridge(
         val item = handler.nowPlaying.value ?: return
         if (item.mediaId.isBlank()) return
         lastPublishedTrackId = item.mediaId
+        lastAppliedTrackId = item.mediaId
         val data = handler.queueData.value as? QueueData.Data
+        val queueIds = data?.listTracks.orEmpty().map { it.videoId }
+        if (queueIds.isNotEmpty()) {
+            lastAppliedQueueIds = queueIds
+        }
         session.sendPlaybackAction(
             action = PlaybackActions.CHANGE_TRACK,
             trackId = item.mediaId,
@@ -381,17 +386,23 @@ class ListenTogetherPlaybackBridge(
         Logger.i(TAG, "Published current state to the room: ${item.mediaId}")
     }
 
-    private suspend fun publishTrackChangesAsHost() {
+    private suspend fun publishTrackChangesAsHostOrPairGuest() {
         handler.nowPlaying
             .filterNotNull()
             .distinctUntilChanged { old, new -> old.mediaId == new.mediaId }
             .collect { item ->
                 val state = repository.room.value
-                if (!state.inRoom || !state.isHost || applyingRemote) return@collect
+                val canPublish = state.inRoom && (state.isHost || repository.pairListeningMode)
+                if (!canPublish || applyingRemote) return@collect
                 if (item.mediaId == lastPublishedTrackId) return@collect
                 lastPublishedTrackId = item.mediaId
-                Logger.i(TAG, "Host publishing track change: ${item.mediaId}")
+                lastAppliedTrackId = item.mediaId
                 val data = handler.queueData.value as? QueueData.Data
+                val ids = data?.listTracks.orEmpty().map { it.videoId }
+                if (ids.isNotEmpty()) {
+                    lastAppliedQueueIds = ids
+                }
+                Logger.i(TAG, "${if (state.isHost) "Host" else "Pair Mode Guest"} publishing track change: ${item.mediaId}")
                 session.sendPlaybackAction(
                     action = PlaybackActions.CHANGE_TRACK,
                     trackId = item.mediaId,
@@ -433,19 +444,20 @@ class ListenTogetherPlaybackBridge(
             }
     }
 
-    private suspend fun publishPlayPauseAsHost() {
+    private suspend fun publishPlayPauseAsHostOrPairGuest() {
         handler.controlState
             .map { it.isPlaying }
             .distinctUntilChanged()
             .collect { isPlaying ->
                 val state = repository.room.value
-                if (!state.inRoom || !state.isHost || applyingRemote) return@collect
+                val canPublish = state.inRoom && (state.isHost || repository.pairListeningMode)
+                if (!canPublish || applyingRemote) return@collect
                 // A host that merely buffers reports isPlaying=false, indistinguishable from a
                 // user pause — and publishing it stops the WHOLE room on one device's hiccup.
                 // playWhenReady carries the intent, so a dip where the two disagree is not news.
                 val intent = handler.player.playWhenReady
                 if (isPlaying != intent) return@collect
-                Logger.i(TAG, "Host publishing ${if (intent) "PLAY" else "PAUSE"}")
+                Logger.i(TAG, "${if (state.isHost) "Host" else "Pair Mode Guest"} publishing ${if (intent) "PLAY" else "PAUSE"}")
                 session.sendPlaybackAction(
                     action = if (intent) PlaybackActions.PLAY else PlaybackActions.PAUSE,
                     // Deliberately EMPTY. The server rejects a play/pause whose trackId does not
@@ -469,7 +481,7 @@ class ListenTogetherPlaybackBridge(
      * API and Desktop runs mpv. A seek is a position that moved further than wall-clock time could
      * account for; ordinary playback advances roughly in step with it.
      */
-    private suspend fun publishSeeksAsHost() {
+    private suspend fun publishSeeksAsHostOrPairGuest() {
         var lastProgress = 0L
         var lastAt = 0L
         handler.simpleMediaState.collect { mediaState ->
@@ -481,14 +493,15 @@ class ListenTogetherPlaybackBridge(
             lastAt = now
 
             val state = repository.room.value
-            if (!state.inRoom || !state.isHost || applyingRemote) return@collect
+            val canPublish = state.inRoom && (state.isHost || repository.pairListeningMode)
+            if (!canPublish || applyingRemote) return@collect
             if (previousAt == 0L) return@collect
 
             val elapsed = now - previousAt
             val expected = previous + if (handler.player.isPlaying) elapsed else 0L
             if (kotlin.math.abs(progress - expected) < SEEK_DETECT_MS) return@collect
 
-            Logger.i(TAG, "Host publishing SEEK to $progress (expected ~$expected)")
+            Logger.i(TAG, "${if (state.isHost) "Host" else "Pair Mode Guest"} publishing SEEK to $progress (expected ~$expected)")
             session.sendPlaybackAction(
                 action = PlaybackActions.SEEK,
                 trackId = "",
@@ -496,46 +509,6 @@ class ListenTogetherPlaybackBridge(
                 trackInfo = null,
             )
         }
-    }
-
-    private suspend fun publishTrackChangesAsGuestInPairMode() {
-        handler.nowPlaying
-            .filterNotNull()
-            .distinctUntilChanged { old, new -> old.mediaId == new.mediaId }
-            .collect { item ->
-                val state = repository.room.value
-                if (!state.inRoom || state.isHost || !repository.pairListeningMode || applyingRemote) return@collect
-                if (item.mediaId == lastPublishedTrackId) return@collect
-                lastPublishedTrackId = item.mediaId
-                Logger.i(TAG, "Pair Mode Guest publishing track change: ${item.mediaId}")
-                val data = handler.queueData.value as? QueueData.Data
-                session.sendPlaybackAction(
-                    action = PlaybackActions.CHANGE_TRACK,
-                    trackId = item.mediaId,
-                    position = 0L,
-                    trackInfo = item.toTrackInfo(),
-                    queue = data?.listTracks.orEmpty().map { it.toTrackInfo() },
-                    queueTitle = data?.playlistName.orEmpty(),
-                )
-            }
-    }
-
-    private suspend fun publishPlayPauseAsGuestInPairMode() {
-        handler.controlState
-            .map { it.isPlaying }
-            .distinctUntilChanged()
-            .collect { playing ->
-                val state = repository.room.value
-                if (!state.inRoom || state.isHost || !repository.pairListeningMode || applyingRemote) return@collect
-                val item = handler.nowPlaying.value ?: return@collect
-                Logger.i(TAG, "Pair Mode Guest publishing play/pause: $playing")
-                session.sendPlaybackAction(
-                    action = if (playing) PlaybackActions.PLAY else PlaybackActions.PAUSE,
-                    trackId = item.mediaId,
-                    position = handler.player.currentPosition,
-                    trackInfo = null,
-                )
-            }
     }
 
     // ─────────────────────────── the buffer barrier ───────────────────────────
